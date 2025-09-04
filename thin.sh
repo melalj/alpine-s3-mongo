@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/bash
+set -e
 
 required_vars="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION S3_BUCKET THIN_ARCHIVE_NAME"
 
@@ -25,7 +26,7 @@ delete_versions_based_on_policy() {
     declare -A seen_hourly seen_daily seen_weekly seen_monthly
 
     # List all versions of the file, sorted by last modified date (newest first)
-    aws s3api list-object-versions --bucket "$S3_BUCKET" --prefix "$THIN_ARCHIVE_NAME" --query 'Versions[?Key==`'$THIN_ARCHIVE_NAME'`].[LastModified,VersionId]' --output text | sort -r | while read -r line; do
+    /usr/bin/aws s3api list-object-versions --bucket "$S3_BUCKET" --prefix "$THIN_ARCHIVE_NAME" --query 'Versions[?Key==`'$THIN_ARCHIVE_NAME'`].[LastModified,VersionId]' --output text | sort -r | while read -r line; do
         
         # Extract the date/time and version ID
         local file_datetime=$(echo $line | awk '{print $1}')
@@ -36,10 +37,23 @@ delete_versions_based_on_policy() {
         fi
 
         # Convert ISO 8601 datetime to Unix timestamp
-        local file_ts=$(date -d "$file_datetime" +%s 2>/dev/null)
-        if [ $? -ne 0 ]; then
-            # Fallback for different date formats
-            file_ts=$(date -d "${file_datetime%T*} ${file_datetime#*T}" +%s 2>/dev/null)
+        # Handle formats like: 2025-09-04T16:59:15.000Z
+        # Alpine's date doesn't handle +00:00 format well, so we use a different approach
+        local clean_datetime=$(echo "$file_datetime" | sed 's/\.[0-9]*Z$//' | sed 's/Z$//' | sed 's/T/ /')
+        local file_ts=$(TZ=UTC date -d "$clean_datetime" +%s 2>/dev/null)
+        
+        if [ -z "$file_ts" ] || [ "$file_ts" = "" ]; then
+            # Try alternative format parsing
+            local year=$(echo "$file_datetime" | cut -d'T' -f1 | cut -d'-' -f1)
+            local month=$(echo "$file_datetime" | cut -d'T' -f1 | cut -d'-' -f2)
+            local day=$(echo "$file_datetime" | cut -d'T' -f1 | cut -d'-' -f3)
+            local time=$(echo "$file_datetime" | cut -d'T' -f2 | sed 's/\.[0-9]*Z$//' | sed 's/Z$//')
+            local hour=$(echo "$time" | cut -d':' -f1)
+            local min=$(echo "$time" | cut -d':' -f2)
+            local sec=$(echo "$time" | cut -d':' -f3)
+            
+            # Use date with explicit format
+            file_ts=$(TZ=UTC date -d "$year-$month-$day $hour:$min:$sec" +%s 2>/dev/null)
         fi
         
         if [ -z "$file_ts" ]; then
@@ -50,9 +64,9 @@ delete_versions_based_on_policy() {
         # Calculate the age of the file in hours, days, and weeks
         local file_age_hours=$(( (current_date - file_ts) / 3600 ))
         local file_age_days=$((file_age_hours / 24))
-        local file_date=$(date -d "$file_datetime" +%Y-%m-%d 2>/dev/null)
-        local file_week=$(date -d "$file_datetime" +%Y-%V 2>/dev/null)
-        local file_month=$(date -d "$file_datetime" +%Y-%m 2>/dev/null)
+        local file_date=$(date -d "@$file_ts" +%Y-%m-%d 2>/dev/null)
+        local file_week=$(date -d "@$file_ts" +%Y-%V 2>/dev/null)
+        local file_month=$(date -d "@$file_ts" +%Y-%m 2>/dev/null)
 
         if [ -z "$file_date" ] || [ -z "$file_week" ] || [ -z "$file_month" ]; then
             echo "Warning: Could not extract date components from $file_datetime, skipping"
@@ -62,7 +76,7 @@ delete_versions_based_on_policy() {
         # Apply retention policies
         if [ $file_age_hours -le $KEEP_HOURLY_FOR_IN_HOURS ]; then
             # For KEEP_HOURLY_FOR_IN_HOURS hours, keep only one backup per hour
-            local file_hour=$(date -d "$file_datetime" +%Y-%m-%d-%H 2>/dev/null)
+            local file_hour=$(date -d "@$file_ts" +%Y-%m-%d-%H 2>/dev/null)
             if [[ -z ${seen_hourly[$file_hour]} ]]; then
                 # This is the first backup of the hour, keep it
                 echo "kept(hourly): $file_datetime"
@@ -70,7 +84,7 @@ delete_versions_based_on_policy() {
             else
                 # Subsequent backup for the hour, delete it
                 echo "deleting: $file_datetime (version: $file_version_id)"
-                aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
+                /usr/bin/aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
                 echo " ok"
             fi
         elif [ $file_age_days -le $KEEP_DAILY_FOR_IN_DAYS ]; then
@@ -82,7 +96,7 @@ delete_versions_based_on_policy() {
             else
                 # Subsequent backup for the day, delete it
                 echo "deleting: $file_datetime (version: $file_version_id)"
-                aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
+                /usr/bin/aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
                 echo " ok"
             fi
         elif [ $file_age_days -le $(($KEEP_WEEKLY_FOR_IN_WEEKS * 7)) ]; then
@@ -92,7 +106,7 @@ delete_versions_based_on_policy() {
               seen_weekly[$file_week]=1
             else
                 echo "deleting: $file_datetime (version: $file_version_id)"
-                aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
+                /usr/bin/aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
                 echo " ok"
             fi
         elif [ $file_age_days -le $(($KEEP_MONTHLY_FOR_IN_MONTHS * 30)) ]; then
@@ -102,13 +116,13 @@ delete_versions_based_on_policy() {
                 echo "kept(monthly): $file_datetime"
             else
                 echo "deleting: $file_datetime (version: $file_version_id)"
-                aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
+                /usr/bin/aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
                 echo " ok"
             fi
         else
             # Delete backups older than KEEP_MONTHLY_FOR_IN_MONTHS months
             echo "deleted $THIN_ARCHIVE_NAME $file_datetime (version: $file_version_id)"
-            aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
+            /usr/bin/aws s3api delete-object --bucket "$S3_BUCKET" --key "$THIN_ARCHIVE_NAME" --version-id "$file_version_id" > /dev/null
         fi
     done
 }
